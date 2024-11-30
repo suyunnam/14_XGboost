@@ -1,0 +1,412 @@
+---
+title: "XGBoost"
+format: html
+---
+
+# Setup  
+```{r}
+#| message: false
+#| warning: false
+
+#install.packages("ranger")
+
+library(tidymodels)
+library(tidyverse)
+library(vip)
+library(finetune)
+library(xgboost)
+```
+
+```{r weather}
+weather <- read_csv("../data/weather_monthsum.csv")
+
+weather
+```
+
+# ML workflow  
+We're going to use the same workflow as we used for elastic net.   
+
+## 1. Pre-processing  
+Here's where we perform **data split** and **data processing**.  
+
+### a. Data split  
+For data split, let's use **70% training / 30% testing**.
+
+```{r weather_split}
+# Setting seed to get reproducible results  
+set.seed(931735)
+
+# Setting split level  
+weather_split <- initial_split(weather, 
+                               prop = .7)
+
+weather_split
+```
+
+
+```{r weather_train}
+# Setting train set 
+weather_train <- training(weather_split)
+
+weather_train
+```
+How many observations?
+
+```{r weather_test}
+# Setting test split
+weather_test <- testing(weather_split)
+
+weather_test
+```
+How many observations?  
+
+Now, we put our **test set** aside and continue with our **train set** for training.  
+
+  
+### b. Data processing  
+Before training, we need to perform some processing steps, like  
+  - **normalizing**  
+  - **removing unimportant variables**  
+  - dropping NAs  
+  - performing PCA on the go  
+  - removing columns with single value  
+  - others?  
+
+For that, we'll create a **recipe** of these processing steps. 
+
+This recipe will then be applied now to the **train data**, and easily applied to the **test data** when we bring it back at the end.
+
+Creating a recipe is as easy way to port your processing steps for other data sets without needing to repeat code, and also only considering the data it is being applied to.  
+
+You can find all available recipe step options here: https://tidymodels.github.io/recipes/reference/index.html
+
+> Differently from elastic net, variables do not need to be normalized in random forest, so we'll skip this step  
+
+```{r weather_recipe}
+weather_recipe <-
+  # Defining predicted and predictor variables
+  recipe(strength_gtex ~ .,
+         data = weather_train) %>%
+  # Removing year and site  
+    step_rm(year, site, matches("Jan|Feb|Mar|Apr|Nov|Dec")) #%>%
+  # Normalizing all numeric variables except predicted variable
+  #step_normalize(all_numeric(), -all_outcomes())
+
+weather_recipe
+```
+
+Now that we have our recipe ready, we **need to apply it** to the training data in a process called prepping:
+
+```{r weather_prep}
+weather_prep <- weather_recipe %>%
+  prep()
+
+weather_prep
+```
+
+
+Now, we're ready to start the model training process!
+
+## 2. Training  
+### a. Model specification  
+First, let's specify:  
+  - the **type of model** we want to train  
+  - which **engine** we want to use  
+  - which **mode** we want to use  
+
+> Elastic nets can only be run for a numerical response variable. Random forests can be run with either numerical (regression) or categorical (classification) explanatory variable. Therefore, we have the need to specify the mode here.
+
+Random forest **hyperparameters**:  
+  - **trees**: number of trees in the forest    
+  - **mtry**: number of random features sampled at each node split    
+    - **min_n**: minimum number of data points in a node that are required for the node to be split further  
+
+Let's create a model specification that will **fine-tune** the first two for us.
+
+A given model type can be fit with different engines (e.g., through different packages). Here, we'll use the **ranger** engine/package.  
+  
+```{r rf_spec}
+xgb_spec <- 
+  boost_tree(
+    trees = tune(),          # Number of trees
+    tree_depth = tune(),     # Maximum depth of trees
+    learn_rate = tune(),     # Learning rate
+    loss_reduction = tune(), # Minimum loss reduction for a split
+    mtry = tune()            # Number of predictors sampled
+  ) %>%
+  set_engine("xgboost") %>% 
+  set_mode("regression")
+  
+xgb_spec
+```
+
+Notice how the main arguments above do not have a value **yet**, because they will be tuned.  
+
+### b. Hyper-parameter tuning  
+For our iterative search, we need:  
+  - Our model specification (`rf_spec`)  
+  - The recipe (`weather_recipe`)  
+  - Our **resampling strategy** (don't have yet)  
+
+> Notice that for rf we do not need to specify the parameter information, as we needed for CIT. The reason is that for rf, all hyperparameters to be tuned are specified at the model level, whereas for CIT one was at model level and one was at the engine level. Engine level hyperparameters need to be "finalized" and have their range of values set up before they can be used in search methods.  
+
+Let's define our resampling strategy below, using a 5-fold cross validation approach:  
+```{r resampling_foldcv}
+set.seed(34549)
+resampling_foldcv <- vfold_cv(weather_train, 
+                              v = 5)
+
+resampling_foldcv
+resampling_foldcv$splits[[1]]
+resampling_foldcv$splits[[2]]
+```
+On each fold, we'll use **390** observations for training and **98** observations to assess performance.    
+
+Now, let's perform the search below.  
+
+We will use an iterative search algorithm called **simulated annealing**.  
+
+Here's how it works:  
+![](https://www.tmwr.org/figures/iterative-neighborhood-1.png)
+  - In the example above, mixture and penalty from an elastic net model are being tuned.  
+
+  - It finds a candidate value of hyperparameters and their associated rmse to start (iteration 1).  
+
+  - It establishes a radius around the first proposal, and randomly chooses a new set of values within that radius.  
+  
+  - If this achieves better results than the previous parameters, it is accepted as the new best and the process continues. If the results are worse than the previous value the search procedure may still use this parameter to define further steps. 
+  
+  - After a given number of iterations, the algorithm stops and provides a list of the best models and their hyperparameters.  
+
+In the algorithm below, we are asking for 50 iterations.  
+
+```{r rf_grid_result}
+set.seed(76544)
+xgb_grid_result <- tune_sim_anneal(object = xgb_spec,
+                     preprocessor = weather_recipe,
+                     resamples = resampling_foldcv,
+                     iter = 10)
+                     
+
+xgb_grid_result
+
+xgb_grid_result$.metrics[[2]]
+```
+Notice how we have a column for iterations.  
+The first iteration uses a sensible value for the hyper-parameters, and then starts "walking" the parameter space in the direction of greatest improvement.  
+
+Let's collect a summary of metrics (across all folds, for each iteration), and plot them.  
+
+Firs, RMSE (lower is better):
+```{r RMSE}
+xgb_grid_result %>%
+  collect_metrics() %>%
+  filter(.metric == "rmse") %>%
+  ggplot(aes(x = learn_rate, 
+             y = tree_depth 
+             )) +
+  geom_path(group = 1) +
+  geom_point(aes(color = mean),
+             size = 3) + 
+  scale_color_viridis_b() +
+  geom_text(aes(label = .iter), nudge_x = .0005) +
+  labs(title = "RMSE")
+```
+
+What tree_depth and min criterion values created lowest RMSE?  
+
+Now, let's look into R2 (higher is better):  
+
+```{r R2}
+xgb_grid_result %>%
+  collect_metrics() %>%
+  filter(.metric == "rsq") %>%
+  ggplot(aes(x = learn_rate, 
+             y = tree_depth 
+             )) +
+  geom_path(group = 1) +
+  geom_point(aes(color = mean),
+             size = 3) + 
+  scale_color_viridis_b() +
+  geom_text(aes(label = .iter), nudge_x = .0005) +
+  labs(title = "R2")
+
+```
+
+> Previously, we selected the single best model. Now, let's select the best model within one std error of the metric, so we choose a model among the top ones that is more parsimonious.  
+
+```{r}
+# Based on lowest RMSE
+best_rmse <- xgb_grid_result %>%
+  select_by_pct_loss("trees",
+                     metric = "rmse",
+                     limit = 2)
+
+best_rmse
+```
+
+```{r}
+# Based on greatest R2
+best_r2 <- xgb_grid_result %>%
+  select_by_pct_loss("trees",
+                     metric = "rsq",
+                     limit = 2)
+
+best_r2
+```
+Based on RMSE, we would choose   
+  - mtry = 24 
+  - trees = 518
+
+Based on R2, we would choose   
+  - mtry = 27
+  - trees = 661
+
+Let's use the hyperparameter values that optimized R2 to fit our final model.
+
+```{r final_spec}
+final_xgb_spec <- boost_tree(
+  trees = best_r2$trees,
+  tree_depth = best_r2$tree_depth,
+  learn_rate = best_r2$learn_rate,
+  loss_reduction = best_r2$loss_reduction,
+  mtry = best_r2$mtry,
+  ) %>%
+  # Specify the engine
+ set_engine("xgboost") %>%
+    # Specifying mode  
+ set_mode("regression")
+  
+final_xgb_spec
+```
+
+## 3. Validation  
+Now that we determined our best model, let's do our **last fit**.
+
+This means 2 things:  
+  - Traninig the optimum hyperparameter values on the **entire training set**  
+  - Using it to **predict** on the **test set**  
+
+These 2 steps can be completed in one function, as below:  
+
+```{r final_fit}
+final_fit <- last_fit(final_xgb_spec,
+                weather_recipe,
+                split = weather_split)
+
+final_fit %>%
+  collect_predictions()
+```
+
+Metrics on the **test set**:
+```{r}
+final_fit %>%
+  collect_metrics()
+```
+
+Metrics on **train set** (for curiosity and compare to test set):  
+```{r}
+# RMSE
+final_xgb_spec %>%
+  fit(strength_gtex ~ .,
+      data = bake(weather_prep, 
+                  weather_train)) %>%
+  augment(new_data = bake(weather_prep, 
+                          weather_train)) %>% 
+  rmse(strength_gtex, .pred) %>%
+  bind_rows(
+    
+    # R2
+    final_xgb_spec %>%
+      fit(strength_gtex ~ .,
+          data = bake(weather_prep, 
+                      weather_train)) %>%
+      augment(new_data = bake(weather_prep, 
+                              weather_train)) %>% 
+      rsq(strength_gtex, .pred)
+    
+  )
+
+```
+How does metrics on test compare to metrics on train?  
+
+Predicted vs. observed plot:  
+```{r}
+final_fit %>%
+  collect_predictions() %>%
+  ggplot(aes(x = strength_gtex,
+             y = .pred)) +
+  geom_point() +
+  geom_abline() +
+  geom_smooth(method = "lm") +
+  scale_x_continuous(limits = c(20, 40)) +
+  scale_y_continuous(limits = c(20, 40)) 
+
+```
+
+Variable importance: 
+
+The importance metric we are evaluating here is **permutation**. 
+
+In the permutation-based approach, for each tree, the out- of-bag sample is passed down the tree and the prediction accuracy is recorded.   
+
+Then the values for each variable (one at a time) are randomly permuted and the accuracy is again computed.   
+
+The decrease in accuracy as a result of this randomly shuffling of feature values is averaged over all the trees for each predictor.   
+
+The variables with the **largest average decrease in accuracy** are considered **most important**.  
+
+```{r}
+final_xgb_spec %>%
+  fit(strength_gtex ~ .,
+         data = bake(weather_prep, weather)) %>%
+    vi(type = "gain") %>%
+  mutate(
+    Variable = fct_reorder(Variable, 
+                           Importance)
+  ) %>%
+  ggplot(aes(x = Importance, 
+             y = Variable)) +
+  geom_col() +
+  scale_x_continuous(expand = c(0, 0)) +
+  labs(y = NULL)
+    
+```
+
+**Therefore, solar radiation in July and August, and minimum temperature in June were the most important variables affecting cotton fiber strength.**  
+
+# Summary  
+In this exercise, we covered: 
+  - Random forest algorithm    
+  - Set up a ML workflow to train an rf model  
+  - Used `recipes` to process data
+  - Used `rsamples` to split data  
+  - Used **iterative search** to find the best values for mas_depth and min_criterion    
+  - Used 5-fold cross validation as the resampling method  
+  - Used both R2 and RMSE as the metrics to select best model  
+  - Once final model was determined, used it to predict **test set**  
+  - Evaluated it with predicted vs. observed plot, R2 and RMSE metrics, variable importance, and tree plot    
+
+# Further resources:  
+
+  - Tidy modeling with R: https://www.tmwr.org  
+  - Tidy modeling with R book club: https://r4ds.github.io/bookclub-tmwr/  
+  
+    - Hands-on ML in R: https://bradleyboehmke.github.io/HOML/  
+  
+  - ML for social scientists: https://cimentadaj.github.io/ml_socsci/  
+
+# Quiz  
+Go on eLC.  
+
+# TEVAL  
+
+Please take 5 min to respond to the TEVAL.  
+Your feedback is really important for me to know what worked, what didn't, and improve for next time.  
+
+Thanks!
+
+Link: https://webapps.franklin.uga.edu/evaluation/?_ga=2.232813078.929468690.1713977543-462720075.1710361396&_gl=1*o88gkf*_ga*NDYyNzIwMDc1LjE3MTAzNjEzOTY.*_ga_3ZLXDSEKEC*MTcxNDAxMzg4Mi4xLjEuMTcxNDAxNDM4MC4wLjAuMA..
+
+
+
